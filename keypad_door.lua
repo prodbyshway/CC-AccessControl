@@ -1,26 +1,86 @@
--- keypad.lua (no door label on monitor)
+-- keypad_door.lua
+-- Touchscreen/terminal keypad. Accepts a typed PIN/code, or a magnetic-card
+-- swipe if a card-reader peripheral is attached, and sends either as the
+-- same {type="verify", tag, code} message - the server decides what the
+-- credential actually resolves to (door PIN, user code, or card token).
 
-local PROTOCOL = "doorAuth.v1"
-local DOOR_TAG = "lobby"   -- <--- set this to your door tag
+os.loadAPI("config_util.lua")
 
--- ---------- Modem ----------
-local function openModems()
-  for _, side in ipairs(rs.getSides()) do
-    if peripheral.getType(side) == "modem" then rednet.open(side) end
+------------- Config -------------
+local defaults = {
+  protocol              = "doorAuth.v1",
+  server_name           = "DoorAuthServer",
+  door_tag              = "lobby",
+  request_timeout       = 3,
+  max_code_length       = 12,
+  entry_label           = "Code",
+  status_poll_interval  = 5,
+}
+
+local fields = {
+  {key="protocol", label="Rednet protocol"},
+  {key="server_name", label="Server host name"},
+  {key="door_tag", label="Door tag"},
+  {key="request_timeout", label="Server request timeout (s)"},
+  {key="max_code_length", label="Max typed code length"},
+  {key="entry_label", label="On-screen entry label"},
+  {key="status_poll_interval", label="Lockdown status poll interval (s)"},
+}
+
+local cfg = config_util.load("keypad_door", defaults, fields, "Keypad Config")
+
+local PROTOCOL             = cfg.protocol
+local SERVER_NAME           = cfg.server_name
+local DOOR_TAG              = cfg.door_tag
+local REQUEST_TIMEOUT       = cfg.request_timeout
+local MAX_CODE_LENGTH       = cfg.max_code_length
+local ENTRY_LABEL           = cfg.entry_label
+local STATUS_POLL_INTERVAL  = cfg.status_poll_interval
+---------------------------------
+
+local trim = config_util.trim
+
+local sharedState = { lockdown = false }
+
+-- ---------- Card reader ----------
+local function findCardManipulator()
+  for _, name in ipairs(peripheral.getNames()) do
+    local p = peripheral.wrap(name)
+    if p and type(p.hasCard) == "function" and type(p.readCard) == "function" then
+      return name, p
+    end
   end
+  return nil
 end
 
-local function findServer()
-  return rednet.lookup(PROTOCOL, "DoorAuthServer")
+local function extractCardCode(value)
+  if type(value) == "string" or type(value) == "number" then
+    return tostring(value)
+  end
+  if type(value) == "table" then
+    for _, key in ipairs({"code","pin","id","uuid","card","value","data","tag"}) do
+      if value[key] ~= nil then return tostring(value[key]) end
+    end
+  end
+  return nil
+end
+
+local function readCardOnce(reader)
+  if not reader.hasCard() then return nil end
+  local ok, raw = pcall(reader.readCard)
+  if not ok then return nil end
+  local code = extractCardCode(raw)
+  if not code or trim(code) == "" then return nil, "empty_card" end
+  return trim(code)
 end
 
 -- ---------- Terminal UI ----------
-local function terminalPIN()
+local function terminalCredential()
   term.clear()
   term.setCursorPos(1,1)
-  write("Enter PIN: ")
-  local pin = read("*") -- masked
-  return pin
+  write("Enter "..ENTRY_LABEL..": ")
+  local code = read("*") -- masked
+  return code
 end
 
 -- ---------- Autoscale + Layout ----------
@@ -44,7 +104,14 @@ local function drawKeypad(mon, layout)
   mon.clear()
 
   local pinY = layout.compact and 1 or 2
-  mon.setCursorPos(2, pinY); mon.write("PIN:")
+  mon.setCursorPos(2, pinY); mon.write(ENTRY_LABEL..":")
+
+  if sharedState.lockdown then
+    mon.setCursorPos(2, pinY+1)
+    mon.setTextColor(colors.red)
+    mon.write("** LOCKDOWN ACTIVE **")
+    mon.setTextColor(colors.white)
+  end
 
   local keys = {
     {"1","2","3"},
@@ -61,7 +128,7 @@ local function drawKeypad(mon, layout)
   else
     bw, bh, gap = 6, 3, 1
     startX = 3
-    startY = pinY + 2
+    startY = pinY + 3
   end
 
   for r=1,4 do
@@ -90,13 +157,15 @@ local function keypadLoop(mon)
 
   local pin = ""
   local function refreshPIN()
-    local x = 6
+    local x = 2 + #ENTRY_LABEL + 2
     mon.setCursorPos(x, geo.pinY)
     mon.write(string.rep(" ", (layout.compact and 10 or 20)))
     mon.setCursorPos(x, geo.pinY)
     mon.write(string.rep("*", #pin))
   end
   refreshPIN()
+
+  local statusTimer = os.startTimer(STATUS_POLL_INTERVAL)
 
   while true do
     local event, p1, p2, p3 = os.pullEvent()
@@ -113,7 +182,7 @@ local function keypadLoop(mon)
               if label == "OK" then return pin
               elseif label == "CLR" then pin = ""; refreshPIN()
               else
-                if #pin < 12 then pin = pin .. label; refreshPIN() end
+                if #pin < MAX_CODE_LENGTH then pin = pin .. label; refreshPIN() end
               end
             end
           end
@@ -122,29 +191,40 @@ local function keypadLoop(mon)
 
     elseif event == "char" then
       local ch = p1
-      if ch:match("%d") and #pin < 12 then pin = pin .. ch; refreshPIN() end
+      if ch:match("%d") and #pin < MAX_CODE_LENGTH then pin = pin .. ch; refreshPIN() end
 
     elseif event == "key" then
       local keyCode = p1
       if keyCode == keys.backspace then pin = pin:sub(1, #pin-1); refreshPIN()
       elseif keyCode == keys.enter then return pin end
+
+    elseif event == "timer" and p1 == statusTimer then
+      geo = drawKeypad(mon, layout)
+      refreshPIN()
+      statusTimer = os.startTimer(STATUS_POLL_INTERVAL)
     end
   end
 end
 
 -- ---------- Verify ----------
-local function trim(s) return tostring(s or ""):gsub("^%s+",""):gsub("%s+$","") end
+local function requestStatus(server)
+  rednet.send(server, {type="status", tag=DOOR_TAG}, PROTOCOL)
+  local id, msg = rednet.receive(PROTOCOL, REQUEST_TIMEOUT)
+  if id == server and type(msg)=="table" and msg.type=="status_result" then
+    sharedState.lockdown = msg.lockdown or false
+  end
+end
 
-local function verifyWithServer(serverID, tag, pin)
-  rednet.send(serverID, {type="verify", tag=tag, pin=pin}, PROTOCOL)
-  local timer = os.startTimer(3)
+local function verifyWithServer(serverID, tag, code)
+  rednet.send(serverID, {type="verify", tag=tag, code=code}, PROTOCOL)
+  local timer = os.startTimer(REQUEST_TIMEOUT)
   while true do
     local ev = { os.pullEvent() }
     if ev[1] == "rednet_message" then
       local id, msg, proto = ev[2], ev[3], ev[4]
       if id==serverID and proto==PROTOCOL and type(msg)=="table"
          and msg.type=="verify_result" and msg.tag==tag then
-        return msg.ok
+        return msg.ok, msg.reason
       end
     elseif ev[1] == "timer" and ev[2] == timer then
       return false,"timeout"
@@ -154,32 +234,45 @@ end
 
 -- ---------- Main ----------
 local function main()
-  openModems()
+  config_util.openModems()
   local mon = peripheral.find("monitor")
+  local readerName, reader = findCardManipulator()
 
-  local server = findServer()
+  local server = config_util.findServer(PROTOCOL, SERVER_NAME)
   if not server then
     print("Finding server...")
-    while not server do sleep(2); server = findServer() end
+    while not server do sleep(2); server = config_util.findServer(PROTOCOL, SERVER_NAME) end
   end
   print("[Keypad] Server #" .. server .. " | Door '"..DOOR_TAG.."'")
+  if readerName then print("[Keypad] Card reader found: "..readerName) end
+
+  requestStatus(server)
 
   while true do
-    local pin = mon and keypadLoop(mon) or terminalPIN()
-    pin = trim(pin)
-
-    if pin == "" then
-      if mon then drawKeypad(mon, decideLayout(mon.getSize())) else print("No PIN entered.") end
+    local code
+    if reader and reader.hasCard() then
+      local cardCode, err = readCardOnce(reader)
+      code = cardCode
+      if not cardCode and mon then drawKeypad(mon, decideLayout(mon.getSize())) end
     else
-      local ok = verifyWithServer(server, DOOR_TAG, pin)
+      code = mon and keypadLoop(mon) or terminalCredential()
+    end
+
+    code = trim(code)
+
+    if code == "" then
+      if mon then drawKeypad(mon, decideLayout(mon.getSize())) else print("No code entered.") end
+    else
+      local ok, reason = verifyWithServer(server, DOOR_TAG, code)
+      if reason == "lockdown" or reason == "locked_out" then sharedState.lockdown = true end
+      local msgText = ok and "GRANTED" or ("DENIED"..(reason and (" ("..reason..")") or ""))
       if mon then
-        local msg = ok and "GRANTED" or "DENIED"
-        mon.setCursorPos(2, (decideLayout(mon.getSize())).compact and 1 or 1)
-        mon.write("Access: "..msg.."        ")
+        mon.setCursorPos(2, 1)
+        mon.write("Access: "..msgText.."        ")
         sleep(ok and 0.8 or 1.2)
         drawKeypad(mon, decideLayout(mon.getSize()))
       else
-        print(ok and "Access GRANTED" or "Access DENIED")
+        print(ok and "Access GRANTED" or ("Access DENIED"..(reason and (" ("..reason..")") or "")))
       end
     end
   end
