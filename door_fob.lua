@@ -1,31 +1,42 @@
 -- door_fob.lua
 -- Pocket Computer wireless keypad for DoorAuth system
--- NOW WITH AUTO-DOOR DISCOVERY + scroll menu
+-- Auto-door-discovery + scroll menu, with a choice between typing a PIN/code
+-- or entering a magnetic-card token by hand (pocket computers generally
+-- don't have a card-manipulator peripheral attached).
 
-local PROTOCOL     = "doorAuth.v1"
-local SERVER_NAME  = "DoorAuthServer"
+os.loadAPI("config_util.lua")
+
+------------- Config -------------
+local defaults = {
+  protocol         = "doorAuth.v1",
+  server_name      = "DoorAuthServer",
+  request_timeout  = 3,
+}
+
+local fields = {
+  {key="protocol", label="Rednet protocol"},
+  {key="server_name", label="Server host name"},
+  {key="request_timeout", label="Server request timeout (s)"},
+}
+
+local cfg = config_util.load("door_fob", defaults, fields, "Door Fob Config")
+
+local PROTOCOL        = cfg.protocol
+local SERVER_NAME      = cfg.server_name
+local REQUEST_TIMEOUT  = cfg.request_timeout
+---------------------------------
+
+local trim = config_util.trim
 
 ---------------------------------------------------
 -- UTILS
 ---------------------------------------------------
-local function openModems()
-  for _,side in ipairs(rs.getSides()) do
-    if peripheral.getType(side)=="modem" then
-      rednet.open(side)
-    end
-  end
-end
-
-local function findServer()
-  return rednet.lookup(PROTOCOL, SERVER_NAME)
-end
-
 local function getDoorList()
-  local server = findServer()
+  local server = config_util.findServer(PROTOCOL, SERVER_NAME)
   if not server then return nil, "Server offline." end
 
   rednet.send(server, {type="door_list"}, PROTOCOL)
-  local id, msg = rednet.receive(PROTOCOL, 3)
+  local id, msg = rednet.receive(PROTOCOL, REQUEST_TIMEOUT)
 
   if not id then return nil, "Timeout." end
   if msg.type ~= "door_list" then return nil, "Bad response." end
@@ -33,30 +44,43 @@ local function getDoorList()
   return msg.tags, nil
 end
 
-local function askPin()
+local function askCredential()
   term.clear()
   term.setCursorPos(1,1)
+  print("=== Entry Method ===")
+  print("1) PIN / Code")
+  print("2) Card Token")
+  write("> ")
+  local choice = trim(read())
+
+  term.clear()
+  term.setCursorPos(1,1)
+  if choice == "2" then
+    print("Enter Card Token:")
+    write("> ")
+    return read()
+  end
+
   print("Enter PIN:")
   write("> ")
-  local pin = read("*")
-  return pin
+  return read("*")
 end
 
-local function sendVerify(tag, pin)
-  local server = findServer()
+local function sendVerify(tag, code)
+  local server = config_util.findServer(PROTOCOL, SERVER_NAME)
   if not server then return nil, "Server offline." end
 
   rednet.send(server, {
     type="verify",
     tag=tag,
-    pin=pin
+    code=code
   }, PROTOCOL)
 
-  local id, msg = rednet.receive(PROTOCOL, 3)
+  local id, msg = rednet.receive(PROTOCOL, REQUEST_TIMEOUT)
   if not id then return nil, "No response." end
   if msg.type ~= "verify_result" then return nil, "Bad response." end
 
-  return msg.ok, nil
+  return msg.ok, msg.reason
 end
 
 ---------------------------------------------------
@@ -126,7 +150,7 @@ end
 ---------------------------------------------------
 -- MAIN LOOP
 ---------------------------------------------------
-openModems()
+config_util.openModems()
 
 while true do
   local door = pickDoor()
@@ -138,12 +162,12 @@ while true do
     goto continue
   end
 
-  local pin = askPin()
+  local code = askCredential()
   term.clear()
   term.setCursorPos(1,1)
   print("Sending…")
 
-  local ok, err = sendVerify(door, pin)
+  local ok, err = sendVerify(door, code)
 
   term.clear()
   term.setCursorPos(1,1)
@@ -151,13 +175,13 @@ while true do
   print("Door: "..door)
   print("")
 
-  if err then
+  if err and ok == nil then
     print("Error: "..err)
   elseif ok then
     print("ACCESS GRANTED")
     print("Door opening…")
   else
-    print("ACCESS DENIED")
+    print("ACCESS DENIED"..(err and (" ("..err..")") or ""))
   end
 
   print("\nPress Enter…")
